@@ -1039,6 +1039,8 @@ COMMAND_HANDLER(max32xxx_qspi_handle_mass_erase_command)
 
 	/* Poll WIP until erase is complete */
 	max32xxx_qspi_poll_wip(target);
+	
+	command_print(CMD, "mass erase complete");
 
 exit:
 	max32xxx_qspi_post_op(bank);
