@@ -19,7 +19,7 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
-
+#include <unistd.h>
 #ifndef _WIN32
 #include <sys/un.h>
 #include <netdb.h>
@@ -33,7 +33,8 @@
 static char *remote_bitbang_host;
 static char *remote_bitbang_port;
 
-static FILE *remote_bitbang_file;
+FILE *remote_bitbang_in;
+FILE *remote_bitbang_out;
 static int remote_bitbang_fd;
 
 /* Circular buffer. When start == end, the buffer is empty. */
@@ -89,7 +90,7 @@ static int remote_bitbang_fill_buf(void)
 
 static int remote_bitbang_putc(int c)
 {
-	if (EOF == fputc(c, remote_bitbang_file)) {
+	if (EOF == fputc(c, remote_bitbang_out)) {
 		LOG_ERROR("remote_bitbang_putc: %s", strerror(errno));
 		return ERROR_FAIL;
 	}
@@ -104,19 +105,20 @@ static void remote_swdio_drive(bool is_output)
 
 static int remote_bitbang_quit(void)
 {
-	if (EOF == fputc('Q', remote_bitbang_file)) {
+	if (EOF == fputc('Q', remote_bitbang_out)) {
 		LOG_ERROR("fputs: %s", strerror(errno));
 		return ERROR_FAIL;
 	}
 
-	if (EOF == fflush(remote_bitbang_file)) {
+	if (EOF == fflush(remote_bitbang_out)) {
 		LOG_ERROR("fflush: %s", strerror(errno));
+		LOG_ERROR("HECK");
 		return ERROR_FAIL;
 	}
 
 	/* We only need to close one of the FILE*s, because they both use the same */
 	/* underlying file descriptor. */
-	if (EOF == fclose(remote_bitbang_file)) {
+	if (EOF == fclose(remote_bitbang_out)) {
 		LOG_ERROR("fclose: %s", strerror(errno));
 		return ERROR_FAIL;
 	}
@@ -143,7 +145,7 @@ static bb_value_t char_to_int(int c)
 /* Get the next read response. */
 static bb_value_t remote_bitbang_rread(void)
 {
-	if (EOF == fflush(remote_bitbang_file)) {
+	if (EOF == fflush(remote_bitbang_out)) {
 		remote_bitbang_quit();
 		LOG_ERROR("fflush: %s", strerror(errno));
 		return BB_ERROR;
@@ -257,7 +259,7 @@ static int remote_bitbang_init_tcp(void)
 		if (connect(fd, rp->ai_addr, rp->ai_addrlen) != -1)
 			break; /* Success */
 
-		close(fd);
+		close(remote_bitbang_fd);
 	}
 
 	freeaddrinfo(result); /* No longer needed */
@@ -313,10 +315,17 @@ static int remote_bitbang_init(void)
 	if (remote_bitbang_fd < 0)
 		return remote_bitbang_fd;
 
-	remote_bitbang_file = fdopen(remote_bitbang_fd, "w+");
-	if (remote_bitbang_file == NULL) {
-		LOG_ERROR("fdopen: failed to open write stream");
+	remote_bitbang_in = fdopen(remote_bitbang_fd, "rb");
+	if (remote_bitbang_in == NULL) {
+		LOG_ERROR("fdopen: failed to open read stream");
 		close(remote_bitbang_fd);
+		return ERROR_FAIL;
+	}
+
+	remote_bitbang_out = fdopen(remote_bitbang_fd, "wb");
+	if (remote_bitbang_out == NULL) {
+		LOG_ERROR("fdopen: failed to open write stream");
+		fclose(remote_bitbang_in);
 		return ERROR_FAIL;
 	}
 
@@ -348,6 +357,22 @@ COMMAND_HANDLER(remote_bitbang_handle_remote_bitbang_host_command)
 
 static const struct command_registration remote_bitbang_command_handlers[] = {
 	{
+		.name = "remote_bitbang_port",
+		.handler = remote_bitbang_handle_remote_bitbang_port_command,
+		.mode = COMMAND_CONFIG,
+		.help = "Set the port to use to connect to the remote jtag.\n"
+			"  if 0 or unset, use unix sockets to connect to the remote jtag.",
+		.usage = "port_number",
+	},
+	{
+		.name = "remote_bitbang_host",
+		.handler = remote_bitbang_handle_remote_bitbang_host_command,
+		.mode = COMMAND_CONFIG,
+		.help = "Set the host to use to connect to the remote jtag.\n"
+			"  if port is 0 or unset, this is the name of the unix socket to use.",
+		.usage = "host_name",
+	},
+		{
 		.name = "art_port",
 		.handler = remote_bitbang_handle_remote_bitbang_port_command,
 		.mode = COMMAND_CONFIG,
@@ -367,6 +392,12 @@ static const struct command_registration remote_bitbang_command_handlers[] = {
 };
 
 
+//static struct jtag_interface remote_bitbang_interface = {
+//	.execute_queue = &art_bitbang_execute_queue,
+//};
+
+//code beyond this point controls ART interface addons
+#if BUILD_ART
 static int art_speed(int speed)
 {
 	LOG_INFO("Called art_speed");
@@ -375,15 +406,12 @@ static int art_speed(int speed)
 
 static int art_speed_div(int speed, int *khz)
 {
-	/* I don't think this really matters any. */
 	*khz = speed / 1000;
-	LOG_INFO("Called art_speed_div");
 	return ERROR_OK;
 }
 
 static int art_khz(int khz, int *jtag_speed)
 {
-LOG_INFO("Called art_khz");
 	*jtag_speed = khz * 1000;
 	return ERROR_OK;
 }
@@ -416,21 +444,24 @@ typedef struct {
 
 static void remote_bitbang_putbuffer(uint8_t *buffer, int count)
 {
-	fwrite(buffer, sizeof(uint8_t), count, remote_bitbang_file);
+	fwrite(buffer, sizeof(uint8_t), count, remote_bitbang_out);
 }
 
 static int remote_bitbang_read_buffer(uint8_t *buffer, int count)
 {
 	int i;
 	int val;
-	if (EOF == fflush(remote_bitbang_file)) {
+	if (EOF == fflush(remote_bitbang_out)) {
 		remote_bitbang_quit();
 		
 		return -1;
 	}
-
+	
+	fflush(remote_bitbang_in);
 	for (i = 0; i < count; i++) {
-		val = fgetc(remote_bitbang_file);
+		if(feof(remote_bitbang_in))
+			return -1;
+		val = fgetc(remote_bitbang_in);
 		buffer[i] = val;
 	}
 	return 0;
@@ -463,7 +494,7 @@ void queue_swdio_read_reg(uint8_t cmd) {
 	packet.id = 'E';
 	packet.cmd = cmd;
 	remote_bitbang_putbuffer((uint8_t *)&packet, sizeof(packet));
-	//fflush(remote_bitbang_out);
+	fflush(remote_bitbang_out);
 	
 	//result = remote_bitbang_read_buffer((uint8_t *)&response, sizeof(response));
 	//if (result == -1) {
@@ -478,7 +509,7 @@ void response_swdio_write_reg(uint8_t *ack) {
 	cmd_writereg_resp_t response;
 	int result;
 
-	//fflush(remote_bitbang_out);
+	fflush(remote_bitbang_out);
 	
 	result = remote_bitbang_read_buffer((uint8_t *)&response, sizeof(response));
 	if (result == -1) {
@@ -501,24 +532,47 @@ void response_swdio_read_reg(uint8_t *ack, uint32_t *data, uint8_t *parity) {
 }
 
 void swdio_flush(void) {
-	fflush(remote_bitbang_file);
+	fflush(remote_bitbang_out);
+	fflush(remote_bitbang_in);
 }
 
-static const char * const art_swd_transports[] = { "swd", NULL };
+void read_flush(int transactionsLeft){
+	int i;
+	uint8_t ack;
+	uint32_t data;
+	uint8_t parity;
+	fflush(remote_bitbang_in);
+	fflush(remote_bitbang_out);
+	fseek(remote_bitbang_in, 0, SEEK_END); 
+	fseek(remote_bitbang_out, 0, SEEK_END); 
+	return;
+	
+	fflush(remote_bitbang_in);
+	if(transactionsLeft == 0)
+		return;
+	for(i = 0; i < transactionsLeft; i++){
+		response_swdio_read_reg(&ack,&data,&parity);
+	}
+}
 
+void seek_to_transactions(int transactions){
+	fseek(remote_bitbang_in, (-1)*sizeof(cmd_readreg_resp_t)*transactions, SEEK_END);
+	fseek(remote_bitbang_out, 0, SEEK_END);
+}
+
+static const char * const art_transports[] = { "swd"};
 struct adapter_driver art_swd_adapter_driver = {
 	.name = "art-swd",
-	.transports = art_swd_transports,
+	.transports = art_transports,
 	.commands = remote_bitbang_command_handlers,
-
+	.swd_ops = &art_bitbang_swd,
 	.init = &remote_bitbang_init,
 	.quit = &remote_bitbang_quit,
 	.reset = &remote_bitbang_reset,
 
-	.swd_ops = &art_bitbang_swd,
-	
-    .speed = &art_speed,
+	//.jtag_ops = &remote_bitbang_interface,
+		.speed = &art_speed,
 	.speed_div = &art_speed_div,
 	.khz = &art_khz,
 };
-
+#endif

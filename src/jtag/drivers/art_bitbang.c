@@ -25,7 +25,7 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
-
+#include <unistd.h>
 #include "art_bitbang.h"
 #include <jtag/interface.h>
 #include <jtag/commands.h>
@@ -289,7 +289,7 @@ static int bitbang_scan(bool ir_scan, enum scan_type type, uint8_t *buffer,
 	return ERROR_OK;
 }
 
-int bitbang_execute_queue(void)
+int art_bitbang_execute_queue(void)
 {
 	struct jtag_command *cmd = jtag_command_queue;	/* currently processed command */
 	int scan_size;
@@ -384,12 +384,6 @@ int bitbang_execute_queue(void)
 
 static int queued_retval;
 
-static int bitbang_swd_init(void)
-{
-	LOG_DEBUG("bitbang_swd_init");
-	return ERROR_OK;
-}
-
 static void bitbang_swd_exchange(bool rnw, uint8_t buf[], unsigned int offset, unsigned int bit_cnt)
 {
 	LOG_DEBUG("bitbang_swd_exchange");
@@ -441,64 +435,6 @@ static void swd_clear_sticky_errors(void)
 		STKCMPCLR | STKERRCLR | WDERRCLR | ORUNERRCLR, 0);
 }
 
-static void bitbang_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_clk)
-{
-	LOG_DEBUG("bitbang_swd_read_reg");
-	assert(cmd & SWD_CMD_RNW);
-
-	if (queued_retval != ERROR_OK) {
-		LOG_DEBUG("Skip bitbang_swd_read_reg because queued_retval=%d", queued_retval);
-		return;
-	}
-
-	for (;;) {
-		uint8_t trn_ack_data_parity_trn[DIV_ROUND_UP(4 + 3 + 32 + 1 + 4, 8)];
-
-		cmd |= SWD_CMD_START | (1 << 7);
-		bitbang_swd_exchange(false, &cmd, 0, 8);
-
-		art_bitbang_interface->swdio_drive(false);
-		bitbang_swd_exchange(true, trn_ack_data_parity_trn, 0, 1 + 3 + 32 + 1 + 1);
-		art_bitbang_interface->swdio_drive(true);
-
-		int ack = buf_get_u32(trn_ack_data_parity_trn, 1, 3);
-		uint32_t data = buf_get_u32(trn_ack_data_parity_trn, 1 + 3, 32);
-		int parity = buf_get_u32(trn_ack_data_parity_trn, 1 + 3 + 32, 1);
-
-		LOG_DEBUG("%s %s %s reg %X = %08"PRIx32,
-			  ack == SWD_ACK_OK ? "OK" : ack == SWD_ACK_WAIT ? "WAIT" : ack == SWD_ACK_FAULT ? "FAULT" : "JUNK",
-			  cmd & SWD_CMD_APNDP ? "AP" : "DP",
-			  cmd & SWD_CMD_RNW ? "read" : "write",
-			  (cmd & SWD_CMD_A32) >> 1,
-			  data);
-
-		switch (ack) {
-		 case SWD_ACK_OK:
-			if (parity != parity_u32(data)) {
-				LOG_DEBUG("Wrong parity detected");
-				queued_retval = ERROR_FAIL;
-				return;
-			}
-			if (value)
-				*value = data;
-			if (cmd & SWD_CMD_APNDP)
-				bitbang_swd_exchange(true, NULL, 0, ap_delay_clk);
-			return;
-		 case SWD_ACK_WAIT:
-			LOG_DEBUG("SWD_ACK_WAIT");
-			swd_clear_sticky_errors();
-			break;
-		 case SWD_ACK_FAULT:
-			LOG_DEBUG("SWD_ACK_FAULT");
-			queued_retval = ack;
-			return;
-		 default:
-			LOG_DEBUG("No valid acknowledge: ack=%d", ack);
-			queued_retval = ack;
-			return;
-		}
-	}
-}
 
 static void bitbang_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_clk)
 {
@@ -552,26 +488,6 @@ static void bitbang_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay
 	}
 }
 
-static int bitbang_swd_run_queue(void)
-{
-	LOG_DEBUG("bitbang_swd_run_queue");
-	/* A transaction must be followed by another transaction or at least 8 idle cycles to
-	 * ensure that data is clocked through the AP. */
-	bitbang_swd_exchange(true, NULL, 0, 8);
-
-	int retval = queued_retval;
-	queued_retval = ERROR_OK;
-	LOG_DEBUG("SWD queue return value: %02x", retval);
-	return retval;
-}
-
-const struct swd_driver bitbang_swd = {
-	.init = bitbang_swd_init,
-	.switch_seq = bitbang_swd_switch_seq,
-	.read_reg = bitbang_swd_read_reg,
-	.write_reg = bitbang_swd_write_reg,
-	.run = bitbang_swd_run_queue,
-};
 
 static struct transaction_queue_entry {
 	uint8_t read;
@@ -601,6 +517,8 @@ static void art_queue_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t unused
 	transaction_queue[transaction_queue_length].dst = value;
 	transaction_queue_length++;
 	queue_swdio_read_reg(cmd);
+	if (cmd & SWD_CMD_APNDP)
+		bitbang_swd_exchange(true, NULL, 0, unused);
 }
 
 static void art_queue_swd_write_reg(uint8_t cmd, uint32_t data, uint32_t unused) {
@@ -608,6 +526,8 @@ static void art_queue_swd_write_reg(uint8_t cmd, uint32_t data, uint32_t unused)
 	transaction_queue[transaction_queue_length].dst = NULL;
 	transaction_queue_length++;
 	queue_swdio_write_reg(cmd, data);
+	if (cmd & SWD_CMD_APNDP)
+		bitbang_swd_exchange(true, NULL, 0, unused);
 }
 
 void swdio_flush(void);
@@ -616,6 +536,7 @@ void response_swdio_read_reg(uint8_t *ack, uint32_t *data, uint8_t *parity);
 
 static int bitbang_swd_run_queue_art(void)
 {
+	int errorCount = 0;
 	int i;
 	uint8_t ack;
 	uint32_t data;
@@ -632,30 +553,65 @@ static int bitbang_swd_run_queue_art(void)
 		//if ((i % 10) == 0) LOG_INFO("run %d", i);
 		if (transaction_queue[i].read) {
 			response_swdio_read_reg(&ack, &data, &parity);
-			if (transaction_queue[i].dst != NULL)
-				*transaction_queue[i].dst = data;
-			if (ack != SWD_ACK_OK) {
-				//LOG_INFO("!!!ack != SWD_ACK_OK1");
-				queued_retval = ack == SWD_ACK_WAIT ? ERROR_WAIT : ERROR_FAIL;
-				goto skip;
+			switch (ack) {
+				case SWD_ACK_OK:
+					if (parity != parity_u32(data)) {
+						LOG_INFO("Wrong parity detected");
+						queued_retval = ERROR_FAIL;
+						break;
+					}
+					//bitbang_swd_exchange(true, NULL, 0, 8);
+					if (transaction_queue[i].dst != NULL)
+						*transaction_queue[i].dst = data;
+					break;
+	 			case SWD_ACK_WAIT:
+					LOG_INFO("SWD_ACK_WAIT");
+					//swd_clear_sticky_errors();
+					queued_retval = ERROR_WAIT;
+					break;
+	 			case SWD_ACK_FAULT:
+					LOG_INFO("SWD_ACK_FAULT");
+					queued_retval = ack;
+					break;
+	 			default:
+					LOG_INFO("No valid acknowledge: ack=%d", ack);
+					queued_retval = ERROR_FAIL;
+					break;
 			}
 		} else {
 			response_swdio_write_reg(&ack);
-			if (ack != SWD_ACK_OK) {
-				//LOG_INFO("!!!ack != SWD_ACK_OK2");
-				queued_retval = ack == SWD_ACK_WAIT ? ERROR_WAIT : ERROR_FAIL;
-				goto skip;
+			switch (ack) {
+				case SWD_ACK_OK:
+					//bitbang_swd_exchange(true, NULL, 0, 8);
+					break;
+	 			case SWD_ACK_WAIT:
+					LOG_INFO("SWD_ACK_WAIT");
+					//swd_clear_sticky_errors();
+					queued_retval = ERROR_WAIT;
+					break;
+	 			case SWD_ACK_FAULT:
+					LOG_INFO("SWD_ACK_FAULT");
+					queued_retval = ack;
+					break;
+	 			default:
+					LOG_INFO("No valid acknowledge: ack=%d", ack);
+					queued_retval = ERROR_FAIL;
+					break;
 			}
 		}
+		if((ack != SWD_ACK_OK) && (ack != SWD_ACK_WAIT)){
+			errorCount++;
+		}
+		
 	}
-
-skip:
 	//LOG_INFO("ending");
+	if(errorCount)
+		queued_retval = ERROR_FAIL;
 	transaction_queue_length = 0;
 
 	int retval = queued_retval;
 	queued_retval = ERROR_OK;
-	//LOG_DEBUG("SWD queue return value: %02x", retval);
+	//LOG_INFO("SWD queue return value: %02x", retval);
 	return retval;
 }
 const struct swd_driver art_bitbang_swd = {
